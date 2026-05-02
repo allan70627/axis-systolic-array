@@ -1,0 +1,4 @@
+systolic_array@40000000 {
+    compatible = "custom,systolic-array";
+    reg = <0x40000000 0x10000>;
+};
