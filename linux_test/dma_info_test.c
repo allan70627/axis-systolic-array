@@ -22,9 +22,11 @@ int main(void)
         return 1;
     }
 
-    printf("Input DMA address : 0x%08x\n", info.in_dma_addr);
-    printf("Output DMA address: 0x%08x\n", info.out_dma_addr);
-    printf("Buffer size       : %u bytes\n", info.buf_size);
+    printf("MM2S0 DMA address: 0x%08x\n", info.mm2s0_dma_addr);
+    printf("MM2S1 DMA address: 0x%08x\n", info.mm2s1_dma_addr);
+    printf("MM2S2 DMA address: 0x%08x\n", info.mm2s2_dma_addr);
+    printf("S2MM  DMA address: 0x%08x\n", info.s2mm_dma_addr);
+    printf("Buffer size      : %u bytes\n", info.buf_size);
 
     close(fd);
     return 0;

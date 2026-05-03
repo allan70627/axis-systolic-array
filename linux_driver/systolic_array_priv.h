@@ -7,6 +7,7 @@
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 
+#define SA_NUM_MM2S 3
 #define SA_DMA_BUF_SIZE 4096
 
 struct sa_dma_buffer {
@@ -20,8 +21,8 @@ struct sa_dev {
     void __iomem *regs;
     struct miscdevice miscdev;
 
-    struct sa_dma_buffer in_buf;
-    struct sa_dma_buffer out_buf;
+    struct sa_dma_buffer mm2s[SA_NUM_MM2S];
+    struct sa_dma_buffer s2mm;
 };
 
 #endif

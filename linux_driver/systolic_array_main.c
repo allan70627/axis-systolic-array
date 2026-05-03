@@ -1,18 +1,16 @@
 /*
  * Systolic Array Linux Driver
  *
- * This is the register-level Linux driver entry point for the AXI systolic array.
- *
  * Current scope:
- *   - Map AXI-Lite registers from the device tree
+ *   - Map AXI-Lite registers from device tree
  *   - Create /dev/systolic_array
- *   - Allow simple register read/write for debugging
- *   - Support ioctl-based register read/write
- *   - Support start/wait helper functions
- *   - Allocate coherent DMA input/output buffers
+ *   - Support ioctl register access
+ *   - Support start/wait helpers
+ *   - Allocate coherent DMA buffers
+ *   - Copy input/output data between user space and DMA buffers
+ *   - Program DMA address/byte registers and run accelerator
  *
  * Future work:
- *   - Add full input/output matrix transfer support
  *   - Add Python/PYNQ wrapper
  */
 
@@ -47,7 +45,7 @@ static ssize_t sa_read_file(struct file *file, char __user *buf,
                             size_t count, loff_t *ppos)
 {
     struct sa_dev *sa = file->private_data;
-    char tmp[384];
+    char tmp[512];
     int len;
 
     len = scnprintf(tmp, sizeof(tmp),
@@ -57,8 +55,10 @@ static ssize_t sa_read_file(struct file *file, char __user *buf,
                     "MM2S_2_DONE=0x%08x\n"
                     "S2MM_DONE=0x%08x\n"
                     "DONE_STATUS=0x%08x\n"
-                    "IN_DMA=0x%pad\n"
-                    "OUT_DMA=0x%pad\n"
+                    "MM2S0_DMA=0x%pad\n"
+                    "MM2S1_DMA=0x%pad\n"
+                    "MM2S2_DMA=0x%pad\n"
+                    "S2MM_DMA=0x%pad\n"
                     "DMA_BUF_SIZE=%zu\n",
                     sa_hw_read_reg(sa, A_START),
                     sa_hw_read_reg(sa, A_MM2S_0_DONE),
@@ -66,9 +66,11 @@ static ssize_t sa_read_file(struct file *file, char __user *buf,
                     sa_hw_read_reg(sa, A_MM2S_2_DONE),
                     sa_hw_read_reg(sa, A_S2MM_DONE),
                     sa_hw_done_status(sa),
-                    &sa->in_buf.dma,
-                    &sa->out_buf.dma,
-                    sa->in_buf.size);
+                    &sa->mm2s[0].dma,
+                    &sa->mm2s[1].dma,
+                    &sa->mm2s[2].dma,
+                    &sa->s2mm.dma,
+                    sa->mm2s[0].size);
 
     return simple_read_from_buffer(buf, count, ppos, tmp, len);
 }
@@ -102,11 +104,53 @@ static ssize_t sa_write_file(struct file *file, const char __user *buf,
     return count;
 }
 
+static int sa_check_run_size(struct sa_dev *sa,
+                             const struct sa_run_config *cfg)
+{
+    if (cfg->mm2s0_bytes > sa->mm2s[0].size)
+        return -EINVAL;
+
+    if (cfg->mm2s1_bytes > sa->mm2s[1].size)
+        return -EINVAL;
+
+    if (cfg->mm2s2_bytes > sa->mm2s[2].size)
+        return -EINVAL;
+
+    if (cfg->s2mm_bytes > sa->s2mm.size)
+        return -EINVAL;
+
+    return 0;
+}
+
+static void sa_program_dma_registers(struct sa_dev *sa,
+                                     const struct sa_run_config *cfg)
+{
+    /*
+     * Program DMA source/sink addresses and byte counts.
+     *
+     * MM2S = memory mapped to stream, so hardware reads from DDR.
+     * S2MM = stream to memory mapped, so hardware writes to DDR.
+     */
+    sa_hw_write_reg(sa, A_MM2S_0_ADDR,  (u32)sa->mm2s[0].dma);
+    sa_hw_write_reg(sa, A_MM2S_0_BYTES, cfg->mm2s0_bytes);
+
+    sa_hw_write_reg(sa, A_MM2S_1_ADDR,  (u32)sa->mm2s[1].dma);
+    sa_hw_write_reg(sa, A_MM2S_1_BYTES, cfg->mm2s1_bytes);
+
+    sa_hw_write_reg(sa, A_MM2S_2_ADDR,  (u32)sa->mm2s[2].dma);
+    sa_hw_write_reg(sa, A_MM2S_2_BYTES, cfg->mm2s2_bytes);
+
+    sa_hw_write_reg(sa, A_S2MM_ADDR,    (u32)sa->s2mm.dma);
+    sa_hw_write_reg(sa, A_S2MM_BYTES,   cfg->s2mm_bytes);
+}
+
 static long sa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct sa_dev *sa = file->private_data;
     struct sa_reg_access reg;
     struct sa_dma_info info;
+    struct sa_dma_transfer xfer;
+    struct sa_run_config run_cfg;
     sa_u32 status;
     int ret;
 
@@ -152,12 +196,44 @@ static long sa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return 0;
 
     case SA_IOC_GET_DMA_INFO:
-        info.in_dma_addr = (sa_u32)sa->in_buf.dma;
-        info.out_dma_addr = (sa_u32)sa->out_buf.dma;
-        info.buf_size = (sa_u32)sa->in_buf.size;
+        info.mm2s0_dma_addr = (sa_u32)sa->mm2s[0].dma;
+        info.mm2s1_dma_addr = (sa_u32)sa->mm2s[1].dma;
+        info.mm2s2_dma_addr = (sa_u32)sa->mm2s[2].dma;
+        info.s2mm_dma_addr  = (sa_u32)sa->s2mm.dma;
+        info.buf_size       = (sa_u32)sa->mm2s[0].size;
 
         if (copy_to_user((void __user *)arg, &info, sizeof(info)))
             return -EFAULT;
+
+        return 0;
+
+    case SA_IOC_COPY_TO_DMA:
+        if (copy_from_user(&xfer, (void __user *)arg, sizeof(xfer)))
+            return -EFAULT;
+
+        return sa_dma_copy_to_buffer(sa, &xfer);
+
+    case SA_IOC_COPY_FROM_DMA:
+        if (copy_from_user(&xfer, (void __user *)arg, sizeof(xfer)))
+            return -EFAULT;
+
+        return sa_dma_copy_from_buffer(sa, &xfer);
+
+    case SA_IOC_RUN:
+        if (copy_from_user(&run_cfg, (void __user *)arg, sizeof(run_cfg)))
+            return -EFAULT;
+
+        ret = sa_check_run_size(sa, &run_cfg);
+        if (ret)
+            return ret;
+
+        sa_program_dma_registers(sa, &run_cfg);
+        sa_hw_start(sa);
+
+        ret = sa_hw_wait_done(sa,
+                              run_cfg.timeout_us ? run_cfg.timeout_us : 1000000);
+        if (ret)
+            return ret;
 
         return 0;
 
@@ -246,4 +322,4 @@ static struct platform_driver sa_platform_driver = {
 module_platform_driver(sa_platform_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Register-level Linux driver for AXI systolic array");
+MODULE_DESCRIPTION("Linux driver for AXI systolic array");
