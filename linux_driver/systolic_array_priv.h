@@ -5,6 +5,7 @@
 #include <linux/miscdevice.h>
 #include <linux/types.h>
 #include <linux/io.h>
+#include <linux/dma-mapping.h>
 
 #define SA_DMA_BUF_SIZE 4096
 

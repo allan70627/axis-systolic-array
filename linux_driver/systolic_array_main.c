@@ -8,10 +8,10 @@
  *   - Create /dev/systolic_array
  *   - Allow simple register read/write for debugging
  *   - Support ioctl-based register read/write
- *   - Support start/wait helper functions through systolic_array_hw.c
+ *   - Support start/wait helper functions
+ *   - Allocate coherent DMA input/output buffers
  *
  * Future work:
- *   - Add DMA/coherent buffer allocation
  *   - Add full input/output matrix transfer support
  *   - Add Python/PYNQ wrapper
  */
@@ -30,15 +30,10 @@
 #include "systolic_array_regs.h"
 #include "systolic_array_ioctl.h"
 #include "systolic_array_hw.h"
+#include "systolic_array_dma.h"
 
 #define DRIVER_NAME "systolic_array"
 
-/*
- * Open operation.
- *
- * For miscdevice, file->private_data initially points to struct miscdevice.
- * Convert it once here so read/write/ioctl can all use struct sa_dev directly.
- */
 static int sa_open(struct inode *inode, struct file *file)
 {
     struct miscdevice *miscdev = file->private_data;
@@ -48,20 +43,11 @@ static int sa_open(struct inode *inode, struct file *file)
     return 0;
 }
 
-/*
- * /dev/systolic_array read operation.
- *
- * This is a simple debug/status interface. Running:
- *
- *   cat /dev/systolic_array
- *
- * prints several important control/status registers.
- */
 static ssize_t sa_read_file(struct file *file, char __user *buf,
                             size_t count, loff_t *ppos)
 {
     struct sa_dev *sa = file->private_data;
-    char tmp[256];
+    char tmp[384];
     int len;
 
     len = scnprintf(tmp, sizeof(tmp),
@@ -70,33 +56,23 @@ static ssize_t sa_read_file(struct file *file, char __user *buf,
                     "MM2S_1_DONE=0x%08x\n"
                     "MM2S_2_DONE=0x%08x\n"
                     "S2MM_DONE=0x%08x\n"
-                    "DONE_STATUS=0x%08x\n",
+                    "DONE_STATUS=0x%08x\n"
+                    "IN_DMA=0x%pad\n"
+                    "OUT_DMA=0x%pad\n"
+                    "DMA_BUF_SIZE=%zu\n",
                     sa_hw_read_reg(sa, A_START),
                     sa_hw_read_reg(sa, A_MM2S_0_DONE),
                     sa_hw_read_reg(sa, A_MM2S_1_DONE),
                     sa_hw_read_reg(sa, A_MM2S_2_DONE),
                     sa_hw_read_reg(sa, A_S2MM_DONE),
-                    sa_hw_done_status(sa));
+                    sa_hw_done_status(sa),
+                    &sa->in_buf.dma,
+                    &sa->out_buf.dma,
+                    sa->in_buf.size);
 
     return simple_read_from_buffer(buf, count, ppos, tmp, len);
 }
 
-/*
- * /dev/systolic_array write operation.
- *
- * Expected user input format:
- *
- *   <register_index> <hex_value>
- *
- * Example:
- *
- *   echo "4 12345678" | sudo tee /dev/systolic_array
- *
- * This writes 0x12345678 to register index 4.
- *
- * This string-based interface is kept only as a simple debug path.
- * The cleaner interface is ioctl.
- */
 static ssize_t sa_write_file(struct file *file, const char __user *buf,
                              size_t count, loff_t *ppos)
 {
@@ -118,9 +94,6 @@ static ssize_t sa_write_file(struct file *file, const char __user *buf,
     if (ret != 2)
         return -EINVAL;
 
-    /*
-     * Prevent accidental accesses outside the known register map.
-     */
     if (reg > SA_MAX_REG_INDEX)
         return -EINVAL;
 
@@ -129,15 +102,11 @@ static ssize_t sa_write_file(struct file *file, const char __user *buf,
     return count;
 }
 
-/*
- * ioctl interface.
- *
- * This provides structured register access from user space.
- */
 static long sa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct sa_dev *sa = file->private_data;
     struct sa_reg_access reg;
+    struct sa_dma_info info;
     sa_u32 status;
     int ret;
 
@@ -171,12 +140,6 @@ static long sa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return 0;
 
     case SA_IOC_WAIT:
-        /*
-         * Blocking wait skeleton.
-         *
-         * Wait up to 1 second for all visible done bits to assert.
-         * Later, this can be replaced with interrupt-based waiting.
-         */
         ret = sa_hw_wait_done(sa, 1000000);
         if (ret)
             return ret;
@@ -184,6 +147,16 @@ static long sa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         status = sa_hw_done_status(sa);
 
         if (copy_to_user((void __user *)arg, &status, sizeof(status)))
+            return -EFAULT;
+
+        return 0;
+
+    case SA_IOC_GET_DMA_INFO:
+        info.in_dma_addr = (sa_u32)sa->in_buf.dma;
+        info.out_dma_addr = (sa_u32)sa->out_buf.dma;
+        info.buf_size = (sa_u32)sa->in_buf.size;
+
+        if (copy_to_user((void __user *)arg, &info, sizeof(info)))
             return -EFAULT;
 
         return 0;
@@ -201,14 +174,6 @@ static const struct file_operations sa_fops = {
     .unlocked_ioctl = sa_ioctl,
 };
 
-/*
- * Probe is called when Linux finds a device tree node with:
- *
- *   compatible = "custom,systolic-array";
- *
- * The probe function maps the AXI-Lite register region and registers
- * the misc device, which creates /dev/systolic_array.
- */
 static int sa_probe(struct platform_device *pdev)
 {
     struct sa_dev *sa;
@@ -229,14 +194,20 @@ static int sa_probe(struct platform_device *pdev)
     if (IS_ERR(sa->regs))
         return PTR_ERR(sa->regs);
 
+    ret = sa_dma_init(sa);
+    if (ret)
+        return ret;
+
     sa->miscdev.minor = MISC_DYNAMIC_MINOR;
     sa->miscdev.name = "systolic_array";
     sa->miscdev.fops = &sa_fops;
     sa->miscdev.parent = &pdev->dev;
 
     ret = misc_register(&sa->miscdev);
-    if (ret)
+    if (ret) {
+        sa_dma_cleanup(sa);
         return ret;
+    }
 
     platform_set_drvdata(pdev, sa);
 
@@ -247,32 +218,22 @@ static int sa_probe(struct platform_device *pdev)
     return 0;
 }
 
-/*
- * Remove is called when the driver is unloaded or the device is removed.
- */
 static int sa_remove(struct platform_device *pdev)
 {
     struct sa_dev *sa = platform_get_drvdata(pdev);
 
     misc_deregister(&sa->miscdev);
+    sa_dma_cleanup(sa);
 
     return 0;
 }
 
-/*
- * Device tree match table.
- *
- * This compatible string must match the device tree node.
- */
 static const struct of_device_id sa_of_match[] = {
     { .compatible = "custom,systolic-array" },
     { }
 };
 MODULE_DEVICE_TABLE(of, sa_of_match);
 
-/*
- * Platform driver registration.
- */
 static struct platform_driver sa_platform_driver = {
     .probe = sa_probe,
     .remove = sa_remove,
