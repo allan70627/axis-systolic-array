@@ -9,11 +9,11 @@
  *   - Map AXI-Lite registers from the device tree
  *   - Create /dev/systolic_array
  *   - Allow simple register read/write for debugging
+ *   - Add ioctl-based register access
  *
  * Future work:
  *   - Add DMA/coherent buffer allocation
- *   - Add start/done helper functions
- *   - Add input/output matrix transfer support
+ *   - Add full input/output matrix transfer support
  *   - Add correctness comparison against golden output
  */
 
@@ -26,6 +26,7 @@
 #include <linux/of.h>
 #include <linux/slab.h>
 
+#include "systolic_array_ioctl.h"
 #include "systolic_array_regs.h"
 
 #define DRIVER_NAME "systolic_array"
@@ -45,15 +46,23 @@ struct sa_dev {
 };
 
 /*
- * Read one 32-bit AXI-Lite register.
+ * Convert register index to byte address.
  *
  * The hardware register map uses register indices, not byte offsets.
  * For example, register index 0x4 corresponds to byte offset 0x10
  * because each AXI-Lite register is 4 bytes.
  */
+static inline void __iomem *sa_reg_addr(struct sa_dev *sa, u32 reg_index)
+{
+    return sa->regs + reg_index * REG_STRIDE_BYTES;
+}
+
+/*
+ * Read one 32-bit AXI-Lite register.
+ */
 static inline u32 sa_read(struct sa_dev *sa, u32 reg_index)
 {
-    return ioread32(sa->regs + reg_index * REG_STRIDE_BYTES);
+    return ioread32(sa_reg_addr(sa, reg_index));
 }
 
 /*
@@ -61,7 +70,22 @@ static inline u32 sa_read(struct sa_dev *sa, u32 reg_index)
  */
 static inline void sa_write(struct sa_dev *sa, u32 reg_index, u32 value)
 {
-    iowrite32(value, sa->regs + reg_index * REG_STRIDE_BYTES);
+    iowrite32(value, sa_reg_addr(sa, reg_index));
+}
+
+/*
+ * Open operation.
+ *
+ * For miscdevice, file->private_data initially points to struct miscdevice.
+ * Convert it once here so read/write/ioctl can all use struct sa_dev directly.
+ */
+static int sa_open(struct inode *inode, struct file *file)
+{
+    struct miscdevice *miscdev = file->private_data;
+    struct sa_dev *sa = container_of(miscdev, struct sa_dev, miscdev);
+
+    file->private_data = sa;
+    return 0;
 }
 
 /*
@@ -76,8 +100,7 @@ static inline void sa_write(struct sa_dev *sa, u32 reg_index, u32 value)
 static ssize_t sa_read_file(struct file *file, char __user *buf,
                             size_t count, loff_t *ppos)
 {
-    struct sa_dev *sa = container_of(file->private_data,
-                                     struct sa_dev, miscdev);
+    struct sa_dev *sa = file->private_data;
     char tmp[256];
     int len;
 
@@ -108,12 +131,14 @@ static ssize_t sa_read_file(struct file *file, char __user *buf,
  *   echo "4 12345678" | sudo tee /dev/systolic_array
  *
  * This writes 0x12345678 to register index 4.
+ *
+ * This string-based interface is kept only as a simple debug path.
+ * The cleaner interface is ioctl.
  */
 static ssize_t sa_write_file(struct file *file, const char __user *buf,
                              size_t count, loff_t *ppos)
 {
-    struct sa_dev *sa = container_of(file->private_data,
-                                     struct sa_dev, miscdev);
+    struct sa_dev *sa = file->private_data;
     char tmp[64];
     unsigned int reg;
     unsigned int value;
@@ -142,11 +167,73 @@ static ssize_t sa_write_file(struct file *file, const char __user *buf,
     return count;
 }
 
+/*
+ * ioctl interface.
+ *
+ * This provides structured register access from user space.
+ */
+static long sa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct sa_dev *sa = file->private_data;
+    struct sa_reg_access reg;
+    __u32 status;
+
+    switch (cmd) {
+    case SA_IOC_READ_REG:
+        if (copy_from_user(&reg, (void __user *)arg, sizeof(reg)))
+            return -EFAULT;
+
+        if (reg.reg > SA_MAX_REG_INDEX)
+            return -EINVAL;
+
+        reg.value = sa_read(sa, reg.reg);
+
+        if (copy_to_user((void __user *)arg, &reg, sizeof(reg)))
+            return -EFAULT;
+
+        return 0;
+
+    case SA_IOC_WRITE_REG:
+        if (copy_from_user(&reg, (void __user *)arg, sizeof(reg)))
+            return -EFAULT;
+
+        if (reg.reg > SA_MAX_REG_INDEX)
+            return -EINVAL;
+
+        sa_write(sa, reg.reg, reg.value);
+        return 0;
+
+    case SA_IOC_START:
+        sa_write(sa, A_START, 1);
+        return 0;
+
+    case SA_IOC_WAIT:
+        /*
+         * First skeleton version:
+         * Return 1 only if all visible DMA done bits are 1.
+         * Later this can become a real blocking wait with timeout.
+         */
+        status = sa_read(sa, A_MM2S_0_DONE) &
+                 sa_read(sa, A_MM2S_1_DONE) &
+                 sa_read(sa, A_MM2S_2_DONE) &
+                 sa_read(sa, A_S2MM_DONE);
+
+        if (copy_to_user((void __user *)arg, &status, sizeof(status)))
+            return -EFAULT;
+
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
 
 static const struct file_operations sa_fops = {
     .owner = THIS_MODULE,
+    .open = sa_open,
     .read = sa_read_file,
     .write = sa_write_file,
+    .unlocked_ioctl = sa_ioctl,
 };
 
 /*
